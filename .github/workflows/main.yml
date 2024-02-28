@@ -1,0 +1,120 @@
+name: Release Please testing
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - dev
+      - feature
+
+# permissions:
+#   contents: write
+#   pull-requests: write
+
+jobs:
+  start-runner:
+    name: Start self-hosted EC2 runner
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.start-ec2-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Start EC2 runner
+        id: start-ec2-runner
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: start
+          github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          ec2-image-id: ${{ vars.AMI_ID }}
+          ec2-instance-type: ${{ vars.INSTANCE_TYPE }}
+          subnet-id: subnet-0b2be48f9a3703df0
+          security-group-id: sg-071b19002fb10294e
+
+  tests_e2e:
+    name: Build Android apk
+    needs:
+      - start-runner
+    runs-on: ${{ needs.start-runner.outputs.label }}
+    steps:
+      - name: Checkout the code to specific branch
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.inputs.branch }}
+            
+      - name: Set up JDK
+        uses: actions/setup-java@v2
+        with:
+          distribution: 'zulu'
+          java-version: '11'
+      
+      - run: |
+          sudo apt update
+          sudo apt install unzip
+                
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v2
+              
+      - uses: actions/cache@v2
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+        
+      - name: Extract existing version code
+        run: |
+             version_code=$(grep "develop_versionCode" app/build.gradle | awk '{print $3}' | tr -d '\n')
+             echo "VERSION_CODE=$version_code" >> $GITHUB_ENV
+             
+      - name: Print version code
+        run: |
+             export COMMIT_MSG=$(git log -n 1 --skip 1 --pretty='format:%Creset%s' --no-merges -1)
+             echo ${{ env.VERSION_CODE }}         
+          
+    #   - name: Running Ktlint
+    #     run: ./gradlew ktlintFormat
+        
+      - name: Read Changelog File
+        id: ghpages
+        uses: jaywcjlove/github-action-read-file@main
+        with:
+          path: changelog/cicd_changelog
+        
+      - name: Generate app bundle
+        run: |
+             ./gradlew :app:bundleDevelopRelease
+             export COMMIT_MSG=$(git log -n 1 --skip 1 --pretty='format:%Creset%s' --no-merges -1)
+             echo ${{ env.VERSION_CODE }}
+
+  stop-runner:
+    name: Stop self-hosted EC2 runner
+    needs:
+      - start-runner # required to get output from the start-runner job
+      - tests_e2e # required to wait when the main job is done
+    runs-on: ubuntu-latest
+    if: ${{ always() }} # required to stop the runner even if the error happened in the previous jobs
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: stop
+          github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          label: ${{ needs.start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-runner.outputs.ec2-instance-id }}
